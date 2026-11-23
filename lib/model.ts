@@ -1,4 +1,4 @@
-// Token launch radar, model version radar-2.
+// Token launch radar, model version radar-3.0.
 //
 // One sealed snapshot in, one ranked board out. Every number the board shows
 // is computed at runtime from the snapshot itself: the valuation multiple for
@@ -8,15 +8,31 @@
 // A protocol is pre-token when its record carries no token at all: no
 // CoinGecko id, no symbol and no market cap.
 //
-//   multiple     median mcap/TVL of token-bearing peers, category first,
-//                then family, then the market-wide median (see resolveMultiple).
-//                Every peer's own mcap/TVL is winsorized at 5 first, so one
-//                thin-TVL peer (a token trading at hundreds of times its TVL)
-//                cannot dominate a category's median or a comparable.
-//   growth       clamp(change_7d, -60, 120); growthMult = 1 + growth/100 * 0.5
-//   maturity     0.6 + min(max(age_days or 365, 0), 1095) / 1095 * 0.4
+//   multiple     a shrinkage blend (k = 3) of the category and family
+//                medians of mcap/TVL over token-bearing peers: with nCat
+//                priced peers in the category, (nCat * catMedian +
+//                3 * famMedian) / (nCat + 3), source 'category' when
+//                nCat >= 3 else 'family'; with no priced peer in the
+//                category but nFam in the family, (nFam * famMedian +
+//                3 * globalMedian) / (nFam + 3), source 'family'; else
+//                the market-wide median, source 'global'. Blending
+//                instead of switching means two protocols in the same
+//                category no longer share one identical multiple unless
+//                their categories genuinely coincide. Every peer's own
+//                mcap/TVL is winsorized at 5 first, so one thin-TVL peer
+//                (a token trading at hundreds of times its TVL) cannot
+//                dominate a category's median or a comparable.
+//   growth       clamp(change_7d, -40, 60); growthMult = 1 + growth/100 * 0.5
+//                (range 0.8-1.3); unknown change_7d counts as 0, so 1.0.
+//   maturity     0.8 + min(max(age_days or 365, 0), 1095) / 1095 * 0.2
+//                (range 0.8-1.0); unknown age still counts as 365 days.
 //   chain        1 + min(chains - 1, 5) * 0.02
 //   implied      max(1, round(tvl * multiple * growthMult * maturityMult * chainMult))
+//   confidence   0.5 * min(peers_used / 15, 1)
+//                + 0.25 * (age known ? 1 : 0.4)
+//                + 0.25 * (change_7d known ? 1 : 0.4)
+//                A row's confidence is how much peer, age and momentum
+//                evidence backs its implied value, not a second ranking.
 //
 // The board ranks every watchlist slug plus every pre-token protocol below
 // the watchlist floor that passes the house exclusions (no bridge, liquid
@@ -49,7 +65,7 @@ export interface Snapshot {
 }
 
 /** The model's version label. */
-export const MODEL_VERSION = 'radar-2.1';
+export const MODEL_VERSION = 'radar-3.0';
 
 /** How many live-token protocols the dashboard's live view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -57,15 +73,18 @@ export const LIVE_ROWS = 24;
 /** The model's constants, all stated in the dashboard's data. */
 export const MODEL = {
   growth_weight: 0.5,
-  growth_floor: -60,
-  growth_cap: 120,
-  maturity_floor: 0.6,
-  maturity_range: 0.4,
+  growth_floor: -40,
+  growth_cap: 60,
+  maturity_floor: 0.8,
+  maturity_range: 0.2,
   maturity_days: 1095,
   unknown_age_days: 365,
   chain_step: 0.02,
   chain_cap: 5,
   peer_cap: 5,
+  shrinkage_k: 3,
+  confidence_peer_scale: 15,
+  comparables: 5,
 } as const;
 
 /** Where a protocol's valuation multiple came from. */
@@ -116,6 +135,7 @@ export interface BoardRow {
   growth_multiplier: number;
   maturity_multiplier: number;
   chain_multiplier: number;
+  confidence: number;
   model: {
     multiple: number;
     multiple_source: MultipleSource;
@@ -125,6 +145,7 @@ export interface BoardRow {
     maturity_multiplier: number;
     chain_multiplier: number;
     age_days: number | null;
+    confidence: number;
   };
   comparables: Comparable[];
   farm_steps: string[];
@@ -142,15 +163,28 @@ export interface LiveRow {
   change_7d: number | null;
 }
 
+/** One category's share of the board: how many rows it holds, their total
+ *  implied value, the category median multiple from the peer tables, and
+ *  how many priced peers that median rests on. */
+export interface CategoryStat {
+  category: string;
+  rows: number;
+  total_implied_usd: number;
+  median_multiple: number;
+  peers: number;
+}
+
 /** Everything the dashboard needs: the board, the live set, and the model. */
 export interface RadarData {
   as_of: string;
   source: string;
   floor_usd: number;
-  model_version: 'radar-2.1';
+  model_version: 'radar-3.0';
   model: {
     formula: string;
     peer_cap: number;
+    shrinkage_k: number;
+    confidence_peer_scale: number;
     growth_weight: number;
     growth_floor: number;
     growth_cap: number;
@@ -168,6 +202,7 @@ export interface RadarData {
   board_size: number;
   early_size: number;
   live_size: number;
+  category_stats: CategoryStat[];
   rows: BoardRow[];
   live: LiveRow[];
 }
@@ -327,12 +362,21 @@ export function computeMultiples(snapshot: Snapshot): MultipleTables {
   };
 }
 
-/** A protocol's valuation multiple, from the peer tables.
+/** A protocol's valuation multiple, from the peer tables: a shrinkage
+ *  blend with k = 3, so a thin category is pulled toward its family
+ *  instead of either taking the category median on one peer or jumping
+ *  straight to the family median.
  *
- *  Category median when the category has at least 3 priced peers; else a
- *  50/50 blend of the category median (when the category has any peers) with
- *  the family median; else the family median when the family has at least 3
- *  priced peers; else the market-wide median. */
+ *  Category with at least 1 priced peer: (nCat * catMedian +
+ *  3 * famMedian) / (nCat + 3), source 'category' when nCat >= 3 else
+ *  'family'. Category with 0 peers but a family with at least 1:
+ *  (nFam * famMedian + 3 * globalMedian) / (nFam + 3), source 'family'.
+ *  Otherwise the market-wide median, source 'global'.
+ *
+ *  peersUsed is the count of distinct priced peers that informed the
+ *  multiple: the family pool already contains the category's peers, so
+ *  in the category branch it is the family peer count; in the family
+ *  branch the same; in the global branch the market-wide peer count. */
 export function resolveMultiple(
   category: string | null,
   tables: MultipleTables,
@@ -343,14 +387,13 @@ export function resolveMultiple(
   const family = familyOf(category, tables.families);
   const famPeers = tables.familyPeerCounts[family] ?? 0;
   const famMedian = tables.familyMultiples[family] ?? 0;
-  if (catPeers >= 3 && catMedian !== undefined) {
-    return { multiple: catMedian, source: 'category', peersUsed: catPeers };
-  }
   if (catPeers >= 1 && catMedian !== undefined && famPeers >= 1) {
-    return { multiple: round4((catMedian + famMedian) / 2), source: 'family', peersUsed: famPeers };
+    const blended = (catPeers * catMedian + MODEL.shrinkage_k * famMedian) / (catPeers + MODEL.shrinkage_k);
+    return { multiple: round4(blended), source: catPeers >= 3 ? 'category' : 'family', peersUsed: famPeers };
   }
-  if (famPeers >= 3) {
-    return { multiple: famMedian, source: 'family', peersUsed: famPeers };
+  if (famPeers >= 1) {
+    const blended = (famPeers * famMedian + MODEL.shrinkage_k * tables.globalMultiple) / (famPeers + MODEL.shrinkage_k);
+    return { multiple: round4(blended), source: 'family', peersUsed: famPeers };
   }
   return { multiple: tables.globalMultiple, source: 'global', peersUsed: tables.globalPeers };
 }
@@ -371,8 +414,11 @@ export function impliedValue(
   age: number | null;
 } {
   const age = ageDays(asOf, protocol.listed_at);
-  const rawGrowth = finite(protocol.change_7d, 0);
-  const growthPct = Math.min(MODEL.growth_cap, Math.max(MODEL.growth_floor, rawGrowth));
+  // Unknown 7-day change counts as no change: growth 1.0.
+  const growthPct =
+    protocol.change_7d === null
+      ? 0
+      : Math.min(MODEL.growth_cap, Math.max(MODEL.growth_floor, finite(protocol.change_7d, 0)));
   const growthMult = round4(1 + (growthPct / 100) * MODEL.growth_weight);
   const ageForModel = age ?? MODEL.unknown_age_days;
   const maturityMult = round4(
@@ -382,6 +428,19 @@ export function impliedValue(
   const chainMult = round4(1 + Math.min(Math.max(protocol.chains.length - 1, 0), MODEL.chain_cap) * MODEL.chain_step);
   const implied = Math.max(1, Math.round(protocol.tvl_usd * multiple * growthMult * maturityMult * chainMult));
   return { implied, growthPct, growthMult, maturityMult, chainMult, age };
+}
+
+/** How much evidence backs one row's implied value: half from how many
+ *  priced peers informed its multiple (capped at 15 peers), a quarter
+ *  from whether its age is known (0.4 when the listing date is missing),
+ *  and a quarter from whether its 7-day change is known (0.4 when it is
+ *  missing). A confidence score, not a second ranking. */
+export function confidenceFor(peersUsed: number, age: number | null, changeKnown: boolean): number {
+  return round4(
+    0.5 * Math.min(peersUsed / MODEL.confidence_peer_scale, 1) +
+      0.25 * (age !== null ? 1 : 0.4) +
+      0.25 * (changeKnown ? 1 : 0.4),
+  );
 }
 
 /** The first chain a protocol names, or a neutral phrase. */
@@ -519,17 +578,31 @@ function stepText(action: string, cost: string, time: string): string {
 }
 
 /**
- * A protocol's farm plan: six steps, each an action with a cost and a time.
+ * A protocol's farm plan: seven steps, each an action with a cost and a time.
  * The plan is derived from the protocol's own record (category, primary
  * chain, TVL tier, age), never from a hand-written list of names. It
  * positions the reader for a possible future token; it never promises an
- * airdrop, and it never asks anyone to pay to claim one.
+ * airdrop, and it never asks anyone to pay to claim one. The seventh step
+ * differs by row: watchlist protocols get a steady weekly-use step, while
+ * early-radar protocols get a start-small-and-confirm step, since an
+ * early protocol's deposit path is the least proven part of the plan.
  */
-export function farmSteps(p: SnapshotProtocol, age: number | null): string[] {
+export function farmSteps(p: SnapshotProtocol, age: number | null, isWatchlist: boolean): string[] {
   const chain = chainOf(p);
   const capital = capitalFor(p);
   const hold = holdDaysFor(age);
   const gas = gasFor(chain);
+  const seventh = isWatchlist
+    ? stepText(
+        `Use ${p.name}'s main app on ${chain} at least once a week, even for a small action, so the wallet shows steady use over time rather than one burst of activity`,
+        gas + ' a week',
+        '10 minutes a week',
+      )
+    : stepText(
+        `Start with the smallest amount ${p.name}'s own minimum allows on ${chain} and confirm the deposit lands in the app before adding more capital`,
+        `the smallest amount ${p.name} allows, plus ${gas}`,
+        '15 minutes to check',
+      );
   return [
     stepText(
       `Open a fresh wallet used only for ${p.name}, keep its seed phrase offline on paper and never share it, then fund it with $${capital} plus gas on ${chain}`,
@@ -561,15 +634,16 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): string[] {
       'nothing but the log',
       '5 minutes a week',
     ),
+    seventh,
   ];
 }
 
-/** The top 3 same-category token-bearing peers by market cap, for one row. */
+/** The top 5 same-category token-bearing peers by market cap, for one row. */
 export function comparablesFor(p: SnapshotProtocol, snapshot: Snapshot): Comparable[] {
   return snapshot.protocols
     .filter((q) => q.category === p.category && isPricedPeer(q))
     .sort((a, b) => (b.mcap_usd ?? 0) - (a.mcap_usd ?? 0) || b.tvl_usd - a.tvl_usd || (a.slug < b.slug ? -1 : 1))
-    .slice(0, 3)
+    .slice(0, MODEL.comparables)
     .map((q) => ({
       slug: q.slug,
       name: q.name,
@@ -615,7 +689,8 @@ export function buildBoard(snapshot: Snapshot): BoardRow[] {
   const scored = [...chosen.values()].map((p) => {
     const resolved = resolveMultiple(p.category, tables);
     const valued = impliedValue(p, snapshot.as_of, resolved.multiple);
-    return { p, resolved, valued };
+    const confidence = confidenceFor(resolved.peersUsed, valued.age, p.change_7d !== null);
+    return { p, resolved, valued, confidence, isWatchlist: snapshot.watchlist.includes(p.slug) };
   });
   scored.sort(
     (a, b) =>
@@ -644,6 +719,7 @@ export function buildBoard(snapshot: Snapshot): BoardRow[] {
     growth_multiplier: s.valued.growthMult,
     maturity_multiplier: s.valued.maturityMult,
     chain_multiplier: s.valued.chainMult,
+    confidence: s.confidence,
     model: {
       multiple: s.resolved.multiple,
       multiple_source: s.resolved.source,
@@ -653,10 +729,34 @@ export function buildBoard(snapshot: Snapshot): BoardRow[] {
       maturity_multiplier: s.valued.maturityMult,
       chain_multiplier: s.valued.chainMult,
       age_days: s.valued.age,
+      confidence: s.confidence,
     },
     comparables: comparablesFor(s.p, snapshot),
-    farm_steps: farmSteps(s.p, s.valued.age),
+    farm_steps: farmSteps(s.p, s.valued.age, s.isWatchlist),
   }));
+}
+
+/** One category's share of the board, richest first: rows grouped by
+ *  category, with the category median multiple and priced-peer count
+ *  from the peer tables (0 when the category has no priced peer). */
+export function categoryStats(board: BoardRow[], tables: MultipleTables): CategoryStat[] {
+  const byCategory = new Map<string, { rows: number; total: number }>();
+  for (const r of board) {
+    const cat = r.category ?? 'Unknown';
+    const entry = byCategory.get(cat) ?? { rows: 0, total: 0 };
+    entry.rows += 1;
+    entry.total += r.implied_value_usd;
+    byCategory.set(cat, entry);
+  }
+  return [...byCategory.entries()]
+    .map(([category, entry]) => ({
+      category,
+      rows: entry.rows,
+      total_implied_usd: entry.total,
+      median_multiple: tables.multiples[category] ?? 0,
+      peers: tables.peerCounts[category] ?? 0,
+    }))
+    .sort((a, b) => b.total_implied_usd - a.total_implied_usd || (a.category < b.category ? -1 : 1));
 }
 
 /** Everything the dashboard renders, from the snapshot. */
@@ -665,6 +765,7 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
   const tables = computeMultiples(snapshot);
   const live = liveRows(snapshot);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
+  const category_stats = categoryStats(board, tables);
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -672,8 +773,10 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     model_version: MODEL_VERSION,
     model: {
       formula:
-        'implied = max(1, round(tvl_usd * multiple * growth * maturity * chain)); multiple is the category median mcap/TVL of token-bearing peers when the category has at least 3 peers, else a 50/50 blend of the category median with the family median, else the family median when the family has at least 3 peers, else the market-wide median; each peer mcap/TVL is winsorized at 5 first, so one thin-TVL peer cannot dominate a median; growth = 1 + clamp(change_7d, -60, 120) / 100 * 0.5; maturity = 0.6 + min(max(age_days or 365, 0), 1095) / 1095 * 0.4; chain = 1 + min(chains - 1, 5) * 0.02',
+        'implied = max(1, round(tvl_usd * multiple * growth * maturity * chain)); multiple is a shrinkage blend with k=3: when the category has at least 1 priced peer, (nCat * category median mcap/TVL + 3 * family median mcap/TVL) / (nCat + 3), source category when nCat >= 3 else family; when the category has no priced peer but the family has at least 1, (nFam * family median + 3 * global median) / (nFam + 3), source family; else the market-wide median, source global; each peer mcap/TVL is winsorized at 5 first, so one thin-TVL peer cannot dominate a median; growth = 1 + clamp(change_7d, -40, 60) / 100 * 0.5, 1.0 when change_7d is unknown; maturity = 0.8 + min(max(age_days or 365, 0), 1095) / 1095 * 0.2; chain = 1 + min(chains - 1, 5) * 0.02; confidence = 0.5 * min(peers_used / 15, 1) + 0.25 * (age known ? 1 : 0.4) + 0.25 * (change_7d known ? 1 : 0.4)',
       peer_cap: MODEL.peer_cap,
+      shrinkage_k: MODEL.shrinkage_k,
+      confidence_peer_scale: MODEL.confidence_peer_scale,
       growth_weight: MODEL.growth_weight,
       growth_floor: MODEL.growth_floor,
       growth_cap: MODEL.growth_cap,
@@ -691,6 +794,7 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     board_size: board.length,
     early_size: early,
     live_size: live.length,
+    category_stats,
     rows: board,
     live,
   };

@@ -42,6 +42,8 @@
         <option value="rank">Rank</option>
         <option value="implied">Implied value</option>
         <option value="tvl">TVL</option>
+        <option value="multiple">Multiple</option>
+        <option value="confidence">Confidence</option>
         <option value="change">7-day change</option>
         <option value="age">Age</option>
       </select>
@@ -54,6 +56,21 @@
     <p class="count" id="count" aria-live="polite"></p>
   </section>
 
+  <section class="panel-card" aria-label="Top 10 by implied value">
+    <h2>Top 10 by implied value</h2>
+    <p class="fine" id="chart-note">Log scale (base 10) — equal steps along a bar are equal multiples, not equal dollars.</p>
+    <div id="chart"></div>
+  </section>
+
+  <section class="panel-card" aria-label="Category summary">
+    <h2>By category</h2>
+    <p class="fine">Where the board's implied value sits: each category's protocol count, combined implied value, the median multiple behind it, and how many priced peers that multiple rests on. Sorted by total implied value, highest first.</p>
+    <div class="table-wrap"><table id="cat-table">
+      <thead><tr><th>Category</th><th>Protocols</th><th>Total implied</th><th>Median multiple</th><th>Priced peers</th></tr></thead>
+      <tbody id="cat-rows"></tbody>
+    </table></div>
+  </section>
+
   <section id="board-view" aria-label="Pre-token board">
     <div class="table-wrap">
       <table id="board">
@@ -63,8 +80,10 @@
           <th>Category</th>
           <th>Chains</th>
           <th><button type="button" data-sort="tvl">TVL <span class="arrow"></span></button></th>
+          <th><button type="button" data-sort="multiple">Multiple <span class="arrow"></span></button></th>
           <th><button type="button" data-sort="change">7d <span class="arrow"></span></button></th>
           <th><button type="button" data-sort="age">Age <span class="arrow"></span></button></th>
+          <th><button type="button" data-sort="confidence">Confidence <span class="arrow"></span></button></th>
           <th><button type="button" data-sort="implied">Implied value <span class="arrow"></span></button></th>
         </tr></thead>
         <tbody id="rows"></tbody>
@@ -82,6 +101,23 @@
       </table>
     </div>
   </section>
+
+  <details class="methodology" id="methodology">
+    <summary id="method-summary">Methodology — model formula</summary>
+    <div>
+      <p>Implied value = TVL × multiple × growth × maturity × chain breadth.</p>
+      <ul>
+        <li>Multiple — a shrinkage blend of the category median multiple with the protocol-family median (weight 3 on the family side): thin categories lean on their family instead of a handful of peers. When neither exists, the market-wide median is used.</li>
+        <li>Peers — each peer's market-cap-per-TVL is winsorized at 5× before any median is taken, so one thin-TVL peer cannot dominate a category.</li>
+        <li>Growth — 1 plus half the 7-day TVL change, with the change clamped to −40% / +60%.</li>
+        <li>Maturity — 0.8 to 1.0 from protocol age, rising to 1.0 at 3 years; unknown age counts as 1 year.</li>
+        <li>Chain breadth — +2% per extra chain, up to 5 extra chains.</li>
+        <li>Confidence — 0.5 × min(peers used ÷ 15, 1) + 0.25 for known age + 0.25 for known 7-day change (0.4 each when unknown). It scores how much evidence the multiple rests on, not how good the protocol is.</li>
+      </ul>
+      <p id="method-example"></p>
+      <p class="fine">Implied values are this entry's own ranking claim — not a prediction that a token will ever be issued, and not a price.</p>
+    </div>
+  </details>
 </main>
 
 <aside id="detail" class="detail" hidden aria-labelledby="detail-name" role="dialog" aria-modal="false">
